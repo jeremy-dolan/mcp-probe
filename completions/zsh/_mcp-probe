@@ -1,0 +1,86 @@
+#compdef mcp-probe
+
+# zsh completion for mcp-probe.
+# Place in $fpath and (re)run compinit.
+
+_mcp-probe_url() {
+  local -a expl
+  if [[ $PREFIX != (http|https)://* ]]; then
+    _wanted schemes expl 'scheme' \
+      compadd "$expl[@]" -S '' -- http:// https:// && return 0
+  fi
+  _urls
+}
+
+_mcp-probe() {
+  local curcontext=$curcontext state line ret=1
+  typeset -A opt_args
+
+  # --json and --transcript each replace the report with a data stream, so
+  # neither can follow the other. --help and --version each end the line.
+  _arguments -s -S -C \
+    '(--json -j --transcript -t)'{--json,-j}'[emit the JSON-RPC responses as JSON, keyed by method]' \
+    '(--json -j --transcript -t)'{--transcript,-t}'[emit every HTTP exchange as HTTP message text, verbatim including credentials]' \
+    \*{--request=,-r+}'[probe only this section; repeatable (default: all)]:section:->section' \
+    '(--era -e)'{--era=,-e+}'[protocol era to probe (default: auto-detect)]:era:->era' \
+    '--truncate=[truncate long values (default: 500)]:characters:->truncate' \
+    \*'--header=[extra request header; repeatable]:header:->header' \
+    '--timeout=[per-request timeout (default: 30)]:seconds:->timeout' \
+    '(- : *)--help[show this help message and exit]' \
+    '(- : *)--version[show version number and exit]' \
+    '1:URL:->url' \
+    && ret=0
+
+  case $state in
+    section)
+      local -a sections used
+      sections=(
+        'info:identity and capabilities only, no list calls'
+        'tools:tools/list'
+        'resources:resources/list, then resources/templates/list'
+        'prompts:prompts/list'
+      )
+      # Repeatable, but each section is worth asking for only once.
+      used=( ${(s.:.)opt_args[--request]} ${(s.:.)opt_args[-r]} )
+      _describe -t sections 'section' sections -F used && ret=0
+      ;;
+
+    era)
+      local -a eras
+      eras=(
+        'auto:detect from what the server answers (default)'
+        'modern:2026-07-28 and later, stateless, per-request metadata'
+        'legacy:2025-11-25 and earlier, initialize handshake then session header'
+      )
+      _describe -t eras 'era' eras && ret=0
+      ;;
+
+    truncate)
+      _message -e characters 'characters (0 to never truncate)'
+      ;;
+
+    header)
+      # Only the name is offered: the value belongs to the caller, and the
+      # space in 'K: V' means the whole thing has to be one quoted word.
+      local -a expl names
+      names=(
+        Accept Authorization Content-Type Cookie Origin Referer User-Agent
+        MCP-Protocol-Version Mcp-Method Mcp-Name Mcp-Session-Id X-Api-Key
+      )
+      _wanted header-names expl 'header name' \
+        compadd "$expl[@]" -S ':' -- $names && ret=0
+      ;;
+
+    timeout)
+      _message -e seconds 'seconds'
+      ;;
+
+    url)
+      _mcp-probe_url && ret=0
+      ;;
+  esac
+
+  return ret
+}
+
+_mcp-probe "$@"

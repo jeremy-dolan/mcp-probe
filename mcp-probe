@@ -1,0 +1,1359 @@
+#!/usr/bin/env python3
+"""
+Probe what an MCP server offers (and what it injects into context)
+Author: Jeremy Dolan/Claude-Opus-5 on 2026-08-16
+
+Speaks both eras of the Streamable HTTP transport:
+
+  modern  2026-07-28 and later -- stateless, per-request metadata, no
+          handshake. Identity and capabilities come from server/discover.
+  legacy  2025-11-25 and earlier -- initialize handshake, notifications/
+          initialized, Mcp-Session-Id on every subsequent request.
+
+Default output is one section per HTTP exchange, as the exchanges happened:
+
+  => POST tools/list                       what was asked for
+  <= 200 OK  application/json              what came back
+                                           (blank line, as in HTTP)
+    "tools": [ ... ]                       the result, as JSON
+
+A summary of services found closes the report.
+
+Additionally, two data streaming modes are available:
+
+  --json       every JSON-RPC response as JSON, envelope intact, grouped under
+               the method that asked for it. Server notifications are not
+               replies and do not appear here
+  --transcript every HTTP exchange as HTTP message text, the way curl -v writes
+               it: "> " is what was sent, "< " is what came back, headers and
+               bodies exactly as they went over the wire, nothing withheld --
+               including whatever credentials the request carried
+
+Server text can carry terminal escape sequences, so every string that reaches
+the terminal is escaped first; see safe() below.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import textwrap
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Iterator
+
+CLIENT_INFO = {"name": "mcp-probe", "version": "0.2"}
+# urllib's default announces Python-urllib, which edge filters block on sight.
+USER_AGENT = f"{CLIENT_INFO['name']}/{CLIENT_INFO['version']}"
+
+MODERN_VERSION = "2026-07-28"
+LEGACY_VERSION = "2025-11-25"
+
+META = "io.modelcontextprotocol"
+META_PROTOCOL_VERSION = f"{META}/protocolVersion"
+META_CLIENT_INFO = f"{META}/clientInfo"
+META_CLIENT_CAPABILITIES = f"{META}/clientCapabilities"
+META_SERVER_INFO = f"{META}/serverInfo"
+
+METHOD_NOT_FOUND = -32601
+HEADER_MISMATCH = -32020
+MISSING_CLIENT_CAPABILITY = -32021
+UNSUPPORTED_PROTOCOL_VERSION = -32022
+MODERN_ERRORS = frozenset(
+    (HEADER_MISMATCH, MISSING_CLIENT_CAPABILITY, UNSUPPORTED_PROTOCOL_VERSION)
+)
+
+# A reply carrying no JSON-RPC message means this endpoint does not know the
+# method -- but only at these statuses. Any other refusal rejected the request
+# itself, and a legacy handshake would meet the same wall while reporting the
+# failure against the wrong method.
+FALLBACK_STATUSES = frozenset((200, 400, 404, 405, 501))
+
+# Of those, the ones that refuse the content of a request rather than the path
+# it went to or the verb it used. Only these leave room for the modern
+# envelope to have been what was refused, which is the one thing a legacy
+# handshake changes -- and they are what an edge filter rejecting the modern
+# headers returns.
+CONTENT_REFUSALS = frozenset((400, 501))
+
+MAX_PAGES = 50
+# How long a single value may run before it is cut short, as --truncate sets
+# it. Zero is no limit; the report then carries whatever the server sent.
+TRUNCATE_DEFAULT = 500
+# Every marker -- "=> ", "<= ", "-- ", "!! " -- is three columns wide, so all
+# text starts at column three, whether it follows a marker or sits under one.
+# Nesting steps by two from there, as JSON is usually written.
+MARGIN = "   "
+STEP = "  "
+RULE = "─" * 62
+
+# Field order follows the MCP schema; unknown fields are appended verbatim.
+# A dotted name reports a nested value under its own path, so that what the
+# server nested can be read without a notation of this tool's invention.
+CANONICAL_FIELDS = {
+    "tools": ["name", "title", "description", "inputSchema.properties",
+              "inputSchema.required", "outputSchema", "annotations"],
+    "resources": ["uri", "name", "title", "description", "mimeType", "size", "annotations"],
+    "resourceTemplates": ["uriTemplate", "name", "title", "description", "mimeType", "annotations"],
+    "prompts": ["name", "title", "description", "arguments"],
+}
+
+
+# Three layers have to hold for MCP to work, and a probe can fall out at any
+# of them. The verdict names the one that gave way, because that is what says
+# what to do next -- fix the URL, fix the endpoint, or look elsewhere for MCP.
+NO_HTTP = "nothing answered at this URL"
+NO_JSONRPC = "no JSON-RPC here, so no MCP"
+NO_MCP = "JSON-RPC works here, but no MCP"
+MCP_REFUSED = "an MCP server, but it refused this probe"
+
+
+class ProbeError(Exception):
+    """Fatal: the server could not be reached or spoke neither era.
+
+    Nothing here is a surprise -- probing a URL to find out whether it
+    serves MCP is the job, and finding that it does not is an answer. So
+    the report explains the failure in place, in the section that hit it,
+    and sets reported so that main() does not say it a second time.
+
+    The verdict is the one-line finding for the closing summary, which
+    reports nothing else when the probe never reached an MCP server.
+    """
+
+    def __init__(self, message: str, reported: bool = False,
+                 verdict: str = NO_HTTP):
+        super().__init__(message)
+        self.reported = reported
+        self.verdict = verdict
+
+
+@dataclass
+class RpcError(Exception):
+    code: int
+    message: str
+    data: Any = None
+    method: str = ""
+
+    def __str__(self) -> str:
+        where = f"{self.method}: " if self.method else ""
+        return f"{where}{oneline(self.message)} (code {self.code})"
+
+
+@dataclass
+class Journal:
+    """Verbatim record of every HTTP exchange, for --transcript.
+
+    Bodies are kept as the exact text sent and received, so interleaved
+    notifications, cursors, cache hints and number formatting all survive
+    here, where the parsed messages kept alongside them for --json have
+    already dropped them.
+    """
+
+    exchanges: list = field(default_factory=list)
+    messages: list = field(default_factory=list)
+
+    def record_message(self, method: str, message: dict) -> None:
+        """Keep the reply to one call, envelope intact, for --json."""
+        self.messages.append((method, message))
+
+    def by_method(self) -> dict:
+        grouped: dict = {}
+        for method, message in self.messages:
+            grouped.setdefault(method, []).append(message)
+        return grouped
+
+    def record(self, verb: str, url: str, headers: dict, body: str | None,
+               response: "Response") -> None:
+        self.exchanges.append({
+            "request": {"verb": verb, "url": url,
+                        "headers": headers, "body": body},
+            "response": {"version": response.version, "status": response.status,
+                         "reason": response.reason,
+                         "headers": response.headers,
+                         "body": response.text},
+        })
+
+
+@dataclass
+class Response:
+    status: int
+    headers: Any
+    body: bytes
+    # Redirects followed before this reply, as (status, destination) pairs.
+    hops: list = field(default_factory=list)
+    reason: str = ""
+    version: str = "HTTP/1.1"
+
+    @property
+    def content_type(self) -> str:
+        return (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+
+    @property
+    def text(self) -> str:
+        return self.body.decode("utf-8", "replace")
+
+
+# --------------------------------------------------------------------- HTTP
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Redirects are followed by hand so that POST stays POST."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def http_version(reply: Any) -> str:
+    # http.client reports 11 or 10; anything else is not ours to name.
+    number = getattr(reply, "version", None)
+    return f"HTTP/{number // 10}.{number % 10}" if number in (10, 11) else "HTTP"
+
+
+def sent(request: urllib.request.Request) -> dict:
+    """The headers as urllib sent them, once it has added its own.
+
+    Called after the exchange, so this includes the Host and Content-length
+    urllib supplies -- and the capitalisation it imposes on ours, which is
+    what a case-sensitive server would have seen.
+    """
+    return dict(request.header_items())
+
+
+def http_post(url: str, payload: dict, headers: dict, timeout: float,
+              journal: "Journal | None" = None) -> Response:
+    text = json.dumps(payload)
+    body = text.encode()
+    hops: list = []
+    for _ in range(4):
+        request = urllib.request.Request(url, data=body, method="POST")
+        for name, value in headers.items():
+            request.add_header(name, value)
+        try:
+            with _OPENER.open(request, timeout=timeout) as reply:
+                response = Response(reply.status, reply.headers, reply.read(),
+                                    reason=reply.reason, version=http_version(reply))
+        except urllib.error.HTTPError as exc:
+            response = Response(exc.code, exc.headers, exc.read(),
+                                reason=exc.reason, version=http_version(exc.fp))
+        except urllib.error.URLError as exc:
+            raise ProbeError(f"no reply: {exc.reason}") from None
+        except OSError as exc:
+            raise ProbeError(f"no reply: {exc}") from None
+
+        if journal is not None:
+            journal.record("POST", url, sent(request), text, response)
+
+        location = response.headers.get("Location")
+        if response.status in (301, 302, 303, 307, 308) and location:
+            url = urllib.parse.urljoin(url, location)
+            hops.append((response.status, url))
+            continue
+        response.hops = hops
+        return response
+    raise ProbeError("no reply: too many redirects")
+
+
+def http_delete(url: str, headers: dict, timeout: float,
+                journal: "Journal | None" = None) -> Response | None:
+    request = urllib.request.Request(url, method="DELETE")
+    for name, value in headers.items():
+        request.add_header(name, value)
+    try:
+        with _OPENER.open(request, timeout=timeout) as reply:
+            response = Response(reply.status, reply.headers, reply.read(),
+                                reason=reply.reason, version=http_version(reply))
+    except urllib.error.HTTPError as exc:
+        response = Response(exc.code, exc.headers, exc.read(),
+                            reason=exc.reason, version=http_version(exc.fp))
+    except Exception:
+        return None  # Session teardown is advisory.
+    if journal is not None:
+        journal.record("DELETE", url, sent(request), None, response)
+    return response
+
+
+def parse_sse(text: str) -> list[dict]:
+    """Return the JSON documents carried by an SSE stream's data lines."""
+    messages, data = [], []
+    for line in text.splitlines() + [""]:
+        if line.startswith(":"):
+            continue
+        if line == "":
+            if data:
+                try:
+                    messages.append(json.loads("\n".join(data)))
+                except json.JSONDecodeError:
+                    pass
+                data = []
+            continue
+        if line.startswith("data:"):
+            data.append(line[5:].lstrip())
+    return messages
+
+
+def parse_messages(response: Response) -> list[dict]:
+    """Return the JSON-RPC messages in a response body, whatever its shape."""
+    text = response.text.strip()
+    if not text:
+        return []
+    if response.content_type == "text/event-stream":
+        documents = parse_sse(text)
+    else:
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        documents = document if isinstance(document, list) else [document]
+    # A JSON body is under no obligation to be made of objects. Anything
+    # else in it cannot be a message, and the readers below all index.
+    return [document for document in documents if isinstance(document, dict)]
+
+
+def is_reply(message: dict) -> bool:
+    """Whether this object answers a request, rather than merely mentioning one.
+
+    JSON-RPC spells out both answers: a result member, or an error member
+    that is an object carrying a code and a message. A body whose "error"
+    is a bare string is some other protocol answering -- an OAuth challenge,
+    a gateway's own JSON -- and reading it as a reply would both credit this
+    endpoint with speaking MCP and hand a string to code expecting a code.
+    """
+    return "result" in message or isinstance(message.get("error"), dict)
+
+
+def select(messages: list[dict], request_id: int) -> dict | None:
+    """Pick the reply to our request, ignoring any notifications alongside it."""
+    for message in messages:
+        if message.get("id") == request_id and is_reply(message):
+            return message
+    for message in messages:
+        if is_reply(message):
+            return message
+    return None
+
+
+# ---------------------------------------------------------------- reporting
+
+
+def wrap_width() -> int:
+    """How wide a line may run: the terminal, less a column.
+
+    The terminal actually in front of this run, not an assumed eighty. Ask
+    each time, so a report that outlives a resize follows it. When stdout
+    is not a terminal there is nothing to ask and eighty is the answer.
+    """
+    return max(24, shutil.get_terminal_size((80, 24)).columns - 1)
+
+
+def fold(line: str) -> list[str]:
+    """One body line, broken to fit the terminal it is printed on.
+
+    Wrapped here rather than left to the terminal's own soft wrap, so that
+    a continuation reads as one: it starts a step in from the line it
+    belongs to, and never at column zero, where this tool's markers live.
+    Hyphens do not break, so a date or a version stays whole.
+
+    This is the mode meant to be read. The modes meant to be consumed,
+    --json and --transcript, keep every byte on the line the server put it
+    on and do not come through here.
+    """
+    width = wrap_width()
+    if len(line) <= width:
+        return [line]
+    indent = line[:len(line) - len(line.lstrip())] + STEP
+    return textwrap.wrap(line, width=width, subsequent_indent=indent,
+                         break_on_hyphens=False) or [line]
+
+
+def dig(item: dict, path: str) -> Any:
+    """The value at a dotted path, or None if any step of it is missing."""
+    value: Any = item
+    for step in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(step)
+    return value
+
+
+class Reporter:
+    """Prints the probe as it happens: one section per HTTP exchange.
+
+    A section is headed by the request that produced it and the status line
+    that came back, then a blank line and the result, exactly as HTTP
+    separates headers from body. Printing happens around each call rather
+    than after the last one, so the output arrives in wire order and a slow
+    server shows what it is being asked for.
+
+    Nothing is printed when a raw mode is in force.
+    """
+
+    def __init__(self, enabled: bool = True, limit: int = TRUNCATE_DEFAULT):
+        self.enabled = enabled
+        self.limit = limit
+        self.opened = False   # a section has been started
+        self.in_body = False  # the blank line before the body has been printed
+        self.skipping = False  # the last section was a one-line "not sent"
+
+    def write(self, line: str = "") -> None:
+        if self.enabled:
+            print(line, flush=True)
+
+    def open_section(self, skip: bool = False) -> None:
+        # Consecutive "not sent" lines are a list, not a run of sections.
+        if self.opened and not (skip and self.skipping):
+            self.write()
+        self.opened = True
+        self.skipping = skip
+        self.in_body = True  # anything before the reply is not body text
+
+    def body(self, line: str) -> None:
+        if not self.enabled:
+            return
+        if not self.in_body:
+            self.write()
+            self.in_body = True
+        for part in fold(line):
+            self.write(part)
+
+    # -- request and reply lines
+
+    def request(self, verb: str, method: str, params: dict | None = None) -> None:
+        """The request line. What was sent with it is --transcript's job.
+
+        params is taken but not shown: both eras send the same fixed
+        envelope of protocol version, client capabilities and client
+        identity on every call, differing only in where they put it, and
+        printing that on every section buries the replies.
+        """
+        if not self.enabled:
+            return
+        self.open_section()
+        self.write(f"=> {verb} {safe(oneline(method))}")
+
+    def response(self, response: Response) -> None:
+        """The status line as HTTP wrote it: code, reason, content type."""
+        if not self.enabled:
+            return
+        for status, destination in response.hops:
+            self.write(f"<= {status} → {safe(oneline(destination))}")
+        line = f"<= {response.status}"
+        if response.reason:
+            line += f" {safe(oneline(response.reason))}"
+        # The header as sent, charset and all, not the bare type parsed out
+        # of it: the difference is sometimes the answer.
+        content_type = response.headers.get("Content-Type")
+        if content_type:
+            line += f"  {safe(oneline(content_type))}"
+        session = response.headers.get("Mcp-Session-Id")
+        if session:
+            line += f"  Mcp-Session-Id: {safe(oneline(session))}"
+        self.write(line)
+        self.in_body = False
+
+    def evidence(self, response: Response) -> None:
+        """The headers and body that explain a reply carrying no JSON-RPC.
+
+        Indented, and the body collapsed to one line, so that nothing a
+        server sends can start a line where this tool's own markers live.
+        """
+        for name in TELLTALE_HEADERS:
+            value = response.headers.get(name)
+            if value:
+                self.body(f"{MARGIN}{name.lower()}: {safe(oneline(value))}")
+        body = oneline(response.text)
+        if body:
+            self.body(f"{MARGIN}body: {render_text(body, self.limit)}")
+
+    def problem(self, headline: str, reading: str = "") -> bool:
+        """What went wrong, under a "!!" marker: an outcome and a reading.
+
+        The reading is the finding the outcome amounts to, and there is one
+        only where the outcome does not already say it.
+
+        Returns whether the report carried it, which is what tells the
+        caller if the failure still needs saying somewhere else.
+        """
+        if not self.enabled:
+            return False
+        text = f"{headline}: {reading}" if reading else headline
+        self.write("")  # one blank line, whether or not evidence preceded it
+        self.in_body = True
+        self.marked(text, "!! ")
+        return True
+
+    def hint(self, text: str) -> None:
+        """The next thing to try, on its own line under the problem it follows.
+
+        Not part of the finding: what went wrong is settled by the lines
+        above, and this is only advice about what to do about it.
+        """
+        if self.enabled and text:
+            self.marked(text, "!! Note: ")
+
+    def marked(self, text: str, marker: str) -> None:
+        for line in textwrap.wrap(safe(oneline(text)), width=wrap_width(),
+                                  initial_indent=marker, subsequent_indent=MARGIN):
+            self.write(line)
+
+    def skipped(self, method: str, reason: str) -> None:
+        if not self.enabled:
+            return
+        self.open_section(skip=True)
+        # "request" names what did not go out: the => line above names a verb
+        # and a method, and this line has only the method to go on.
+        self.write(
+            f"-- {safe(oneline(method))} request not sent ({safe(oneline(reason))})")
+
+    def note(self, text: str) -> None:
+        self.body(f"{MARGIN}{safe(oneline(text))}")
+
+    # -- result bodies
+
+    def result(self, result: dict, kind: str | None = None) -> None:
+        """The JSON-RPC result, as JSON, with one list expanded per line."""
+        if not self.enabled:
+            return
+        if not result:
+            self.body(f"{MARGIN}(empty result)")
+            return
+        keys = list(result)
+        for index, key in enumerate(keys):
+            tail = "," if index < len(keys) - 1 else ""
+            value = result[key]
+            if key == kind and isinstance(value, list):
+                self.items(key, value, kind, tail)
+            else:
+                self.body(f'{MARGIN}"{safe(key)}": {render(value, self.limit)}{tail}')
+
+    def items(self, key: str, items: list, kind: str, tail: str) -> None:
+        if not items:
+            self.body(f'{MARGIN}"{safe(key)}": []{tail}')
+            return
+        canonical = CANONICAL_FIELDS[kind]
+        outer, inner = MARGIN + STEP, MARGIN + STEP * 2
+        self.body(f'{MARGIN}"{safe(key)}": [')
+        for index, item in enumerate(items):
+            comma = "," if index < len(items) - 1 else ""
+            if not isinstance(item, dict):
+                self.body(f"{outer}{render(item, self.limit)}{comma}")
+                continue
+            # A field reached by a dotted path has already reported the
+            # object it came out of, so that object is not an unknown field.
+            heads = {name.split(".", 1)[0] for name in canonical}
+            names = canonical + [name for name in item if name not in heads]
+            # A field the server left out says nothing, and a page of nulls
+            # buries the fields it did send. Only what is there is printed.
+            fields = [(name, dig(item, name)) for name in names]
+            fields = [pair for pair in fields if pair[1] is not None]
+            if not fields:
+                self.body(f"{outer}{{}}{comma}")
+                continue
+            self.body(f"{outer}{{")
+            for position, (name, value) in enumerate(fields):
+                separator = "," if position < len(fields) - 1 else ""
+                self.field(inner, name, value, separator)
+            self.body(f"{outer}}}{comma}")
+        self.body(f"{MARGIN}]{tail}")
+
+    def field(self, indent: str, name: str, value: Any, separator: str) -> None:
+        """One field of an item, on its own line or opened out into a block.
+
+        A block renderer returns the lines of its value, already indented,
+        with the opening on the first and the closing on the last. Naming
+        the field and closing the list are this method's to add, so a block
+        renderer never has to know what it is nested in.
+        """
+        block = BLOCKS.get(name)
+        lines = (block(value, self.limit, indent) if block
+                 else [render(value, self.limit)])
+        lines[0] = f'{indent}"{safe(name)}": {lines[0]}'
+        lines[-1] += separator
+        for line in lines:
+            self.body(line)
+
+    def failure(self, error: RpcError) -> None:
+        self.body(f"{MARGIN}error {error.code}: "
+                  f"{render_text(oneline(error.message), self.limit)}")
+        if error.data is not None:
+            self.body(f'{MARGIN}"data": {render(error.data, self.limit)}')
+
+    # -- closing summary
+
+    def summary(self, rows: list[tuple[str, str]]) -> None:
+        if not self.enabled or not rows:
+            return
+        self.write()
+        self.write(RULE)
+        width = max(len(label) for label, _ in rows)
+        for label, value in rows:
+            self.write(f"{MARGIN}{label.ljust(width)}  {safe(oneline(str(value)))}")
+
+
+# ---------------------------------------------------------------- transports
+
+
+@dataclass
+class Options:
+    url: str
+    timeout: float = 30.0
+    extra_headers: dict = field(default_factory=dict)
+    journal: Journal = field(default_factory=Journal)
+    reporter: Reporter = field(default_factory=Reporter)
+
+    def headers(self, **overrides: str) -> dict:
+        merged = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "User-Agent": USER_AGENT,
+        }
+        merged.update(overrides)
+        merged.update(self.extra_headers)
+        return merged
+
+
+class Transport:
+    era = "unknown"
+    version = ""
+    session_id: str | None = None
+
+    def __init__(self, options: Options):
+        self.options = options
+        self.reporter = options.reporter
+        self._next_id = 0
+
+    def request_id(self) -> int:
+        self._next_id += 1
+        return self._next_id
+
+    def exchange(self, method: str, params: dict, headers: dict) -> tuple[Response, dict | None]:
+        request_id = self.request_id()
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        self.reporter.request("POST", method, params)
+        try:
+            response = http_post(self.options.url, payload, headers,
+                                 self.options.timeout, self.options.journal)
+        except ProbeError as error:
+            # Nothing came back at all, so the section has no reply line;
+            # say why here rather than leaving it hanging.
+            error.reported = self.reporter.problem(oneline(str(error)))
+            raise
+        self.reporter.response(response)
+        message = select(parse_messages(response), request_id)
+        if message is not None:
+            self.options.journal.record_message(method, message)
+        return response, message
+
+    def call(self, method: str, params: dict | None = None) -> dict:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+    def paginate(self, method: str, key: str) -> Iterator[dict]:
+        """Follow nextCursor to the end, yielding each page as it arrives."""
+        cursor = None
+        for _ in range(MAX_PAGES):
+            result = self.call(method, {"cursor": cursor} if cursor else {})
+            yield result
+            cursor = result.get("nextCursor")
+            if not cursor:
+                return
+        self.reporter.note(
+            f"stopped after {MAX_PAGES} pages; nextCursor is still set")
+
+
+class ModernTransport(Transport):
+    """2026-07-28 and later: stateless, self-describing requests."""
+
+    era = "modern"
+
+    def __init__(self, options: Options, version: str = MODERN_VERSION):
+        super().__init__(options)
+        self.version = version
+
+    def envelope(self, params: dict | None) -> dict:
+        # protocolVersion and clientCapabilities are required; clientInfo is a SHOULD.
+        meta = {
+            META_PROTOCOL_VERSION: self.version,
+            META_CLIENT_CAPABILITIES: {},
+            META_CLIENT_INFO: CLIENT_INFO,
+        }
+        return {**(params or {}), "_meta": meta}
+
+    def headers(self, method: str) -> dict:
+        # Mcp-Name is required only for tools/call, resources/read and
+        # prompts/get, none of which this tool issues.
+        return self.options.headers(
+            **{"MCP-Protocol-Version": self.version, "Mcp-Method": method}
+        )
+
+    def probe(self) -> tuple[Response, dict | None]:
+        return self.exchange("server/discover", self.envelope(None), self.headers("server/discover"))
+
+    def call(self, method: str, params: dict | None = None) -> dict:
+        response, message = self.exchange(
+            method, self.envelope(params), self.headers(method)
+        )
+        if message is None:
+            raise no_reply(method, response, self.options)
+        return unwrap(message, method)
+
+    def describe(self) -> dict:
+        result = self.call("server/discover")
+        self.reporter.result(result)
+        return result
+
+
+class LegacyTransport(Transport):
+    """2025-11-25 and earlier: initialize handshake plus a session header."""
+
+    era = "legacy"
+
+    def __init__(self, options: Options, version: str = LEGACY_VERSION):
+        super().__init__(options)
+        self.requested_version = version
+
+    def headers(self) -> dict:
+        extra = {}
+        if self.version:
+            extra["MCP-Protocol-Version"] = self.version
+        if self.session_id:
+            extra["Mcp-Session-Id"] = self.session_id
+        return self.options.headers(**extra)
+
+    def call(self, method: str, params: dict | None = None) -> dict:
+        response, message = self.exchange(method, params or {}, self.headers())
+        session = response.headers.get("Mcp-Session-Id")
+        if session:
+            self.session_id = session
+        if message is None:
+            raise no_reply(method, response, self.options)
+        return unwrap(message, method)
+
+    def describe(self) -> dict:
+        result = self.call(
+            "initialize",
+            {
+                "protocolVersion": self.requested_version,
+                "capabilities": {},
+                "clientInfo": CLIENT_INFO,
+            },
+        )
+        self.reporter.result(result)
+        self.version = result.get("protocolVersion") or self.requested_version
+        self.notify("notifications/initialized")
+        return result
+
+    def notify(self, method: str) -> None:
+        payload = {"jsonrpc": "2.0", "method": method}
+        self.reporter.request("POST", method)
+        try:
+            response = http_post(self.options.url, payload, self.headers(),
+                                 self.options.timeout, self.options.journal)
+        except ProbeError:
+            self.reporter.note("no reply (notifications are not acknowledged)")
+            return
+        self.reporter.response(response)
+
+    def close(self) -> None:
+        if not self.session_id:
+            return
+        self.reporter.request("DELETE", "(end session)")
+        response = http_delete(self.options.url, self.headers(),
+                               self.options.timeout, self.options.journal)
+        if response is not None:
+            self.reporter.response(response)
+        else:
+            self.reporter.note("no reply (teardown is advisory)")
+
+
+# Headers that explain a refusal: who refused, why, and whether the request
+# reached the MCP server at all.
+TELLTALE_HEADERS = ("Allow", "WWW-Authenticate", "Retry-After", "Server",
+                    "CF-Ray", "Location")
+
+PATH_HINT = "MCP is usually served from /mcp, not the site root"
+
+
+def refuses_post(response: Response) -> bool:
+    """This reply says POST is not accepted, so no MCP call can succeed."""
+    allow = response.headers.get("Allow") or ""
+    return response.status == 405 or (bool(allow) and "POST" not in allow.upper())
+
+
+def is_json(response: Response) -> bool:
+    try:
+        json.loads(response.text)
+    except ValueError:
+        return False
+    return True
+
+
+def why_not_jsonrpc(response: Response) -> str:
+    """Where a reply carrying no JSON-RPC message actually gave way.
+
+    JSON-RPC is not JSON: a reply can be well-formed JSON and still be no
+    answer to what was asked, which is what a site root serving its CMS
+    does. Saying "no JSON-RPC reply" over a JSON body printed just above
+    reads as a contradiction, so this says which it was.
+    """
+    if refuses_post(response):
+        return "this URL does not accept POST, so no JSON-RPC call can reach it"
+    if not response.text.strip():
+        return "the reply has no body"
+    if response.content_type == "text/event-stream":
+        return "the event stream carried no JSON-RPC message"
+    if is_json(response):
+        return "the reply is JSON, but not a JSON-RPC message"
+    return "the reply is not JSON"
+
+
+def diagnose(response: Response, url: str) -> str:
+    """One line on a reply that carried no JSON-RPC message, or nothing.
+
+    Only what the status line and the headers printed above it do not
+    already say. The status is not restated and the protocol is not
+    explained; what belongs here is the next thing to try.
+    """
+    if response.status == 401 or response.headers.get("WWW-Authenticate"):
+        return "Set MCP_AUTH_TOKEN, or pass --header 'Authorization: ...'"
+    if response.status in (403, 429) and "json" not in response.content_type:
+        return ("A non-JSON body at this status is usually an edge filter, "
+                "often on the User-Agent; try --header 'User-Agent: ...'")
+    if urllib.parse.urlsplit(url).path in ("", "/"):
+        return PATH_HINT
+    return ""
+
+
+def no_reply(method: str, response: Response, options: "Options") -> ProbeError:
+    """Report a reply that carried no JSON-RPC message, and end this path."""
+    options.reporter.evidence(response)
+    reason = why_not_jsonrpc(response)
+    reported = options.reporter.problem(reason)
+    options.reporter.hint(diagnose(response, options.url))
+    return ProbeError(f"{method}: HTTP {response.status}, {reason}",
+                      reported=reported, verdict=NO_JSONRPC)
+
+
+def unwrap(message: dict, method: str = "") -> dict:
+    error = message.get("error")
+    if isinstance(error, dict):
+        raise RpcError(error.get("code", 0), error.get("message", "error"),
+                       error.get("data"), method)
+    return message.get("result") or {}
+
+
+# ----------------------------------------------------------------- detection
+
+
+def detect(options: Options, era: str) -> tuple[Transport, dict]:
+    """Return a connected transport and the result that identified the server."""
+    if era == "legacy":
+        transport = LegacyTransport(options)
+        return transport, transport.describe()
+
+    modern = ModernTransport(options)
+    response, message = modern.probe()
+
+    if message and "result" in message:
+        result = message["result"]
+        options.reporter.result(result)
+        return modern, result
+
+    error = message.get("error") if message else None
+    if isinstance(error, dict):
+        code = error.get("code")
+        options.reporter.failure(
+            RpcError(code or 0, error.get("message", "error"), error.get("data")))
+        if code == UNSUPPORTED_PROTOCOL_VERSION:
+            supported = (error.get("data") or {}).get("supported") or []
+            return retry_with_supported(options, era, supported)
+        if code in MODERN_ERRORS:
+            # Modern server, but it rejected the request for another reason.
+            reported = options.reporter.problem("server/discover was rejected")
+            raise ProbeError(
+                f"server/discover rejected: {oneline(error.get('message'))} "
+                f"(code {code})", reported=reported, verdict=MCP_REFUSED)
+        # It answered in JSON-RPC, so something is listening, but not with a
+        # code that says which era it belongs to. The error above is the
+        # evidence; do not go on to claim nothing replied.
+        headline = "JSON-RPC response indicates modern-era MCP method was refused"
+        advice = ""
+        stopped = f"server/discover refused (HTTP {response.status})"
+        verdict = NO_MCP
+    else:
+        options.reporter.evidence(response)
+        headline = why_not_jsonrpc(response)
+        advice = diagnose(response, options.url)
+        stopped = f"server/discover: HTTP {response.status}, {headline}"
+        verdict = NO_JSONRPC
+
+    reported = options.reporter.problem(headline)
+    options.reporter.hint(advice)
+    stop = ProbeError(stopped, reported=reported, verdict=verdict)
+
+    # Both eras are JSON-RPC over this same POST, so the handshake is worth a
+    # try only where the modern request itself might have been what was
+    # refused. A JSON-RPC error leaves that open. A reply carrying no
+    # JSON-RPC message has already shown what this endpoint serves, and
+    # asking again in a different envelope gets the same thing back.
+    retry = message is not None or (response.status in CONTENT_REFUSALS
+                                    and not refuses_post(response))
+    if era == "modern" or response.status not in FALLBACK_STATUSES or not retry:
+        raise stop
+
+    transport = LegacyTransport(options)
+    return transport, transport.describe()
+
+
+def retry_with_supported(options: Options, era: str, supported: list) -> tuple[Transport, dict]:
+    """The server named its versions; pick one on the right side of the split."""
+    modern = sorted(v for v in supported if v >= MODERN_VERSION)
+    if modern:
+        # Prefer the revision this tool was written against; otherwise the
+        # closest one above it, whose semantics are least likely to differ.
+        chosen = MODERN_VERSION if MODERN_VERSION in modern else modern[0]
+        transport = ModernTransport(options, chosen)
+        return transport, transport.describe()
+    offered = ", ".join(oneline(version) for version in supported) or "nothing"
+    reported = options.reporter.problem("no modern version",
+                                        f"the server offers {offered}")
+    if era == "modern":
+        raise ProbeError(f"server supports no modern version; it offers {offered}",
+                         reported=reported, verdict=MCP_REFUSED)
+    transport = LegacyTransport(options, supported[0] if supported else LEGACY_VERSION)
+    return transport, transport.describe()
+
+
+# ---------------------------------------------------------------- formatting
+
+
+# Control (Cc), format (Cf), surrogate (Cs) and private-use (Co) characters.
+# Cc covers ESC and DEL, Cf covers the bidi overrides and zero-width marks,
+# and both include the C1 range, where U+009B is a one-character CSI.
+UNSAFE_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Co"))
+
+
+LAYOUT = "\n\t"
+
+
+def oneline(text: str) -> str:
+    """Collapse whitespace, so server text cannot forge a line of our output."""
+    return " ".join(str(text).split())
+
+
+def safe(text: str) -> str:
+    """Escape anything a terminal would act on rather than print.
+
+    Everything a server sends reaches a terminal that interprets escape
+    sequences, so no server-supplied byte is printed literally if it could
+    move the cursor, set the window title, recolour the line, hide itself,
+    or reverse the reading order of what follows it.
+
+    Newlines and tabs are layout rather than control, and this tool's own
+    messages are built from them, so they pass through. A newline in
+    server text therefore has to be disarmed before it gets here: either
+    by JSON encoding, which escapes it, by oneline(), which collapses it,
+    or by splitting the text into lines that are each given a "> " or
+    "< " prefix, which is what render_transcript does.
+    """
+    if not any(unicodedata.category(character) in UNSAFE_CATEGORIES
+               and character not in LAYOUT for character in text):
+        return text
+    escaped = []
+    for character in text:
+        if (unicodedata.category(character) not in UNSAFE_CATEGORIES
+                or character in LAYOUT):
+            escaped.append(character)
+            continue
+        point = ord(character)
+        escaped.append(f"\\u{point:04x}" if point <= 0xFFFF else f"\\U{point:08x}")
+    return "".join(escaped)
+
+
+def render(value: Any, limit: int) -> str:
+    """JSON for the value, escaped for a terminal and bounded in length."""
+    text = safe(json.dumps(value, ensure_ascii=False))
+    if not limit or len(text) <= limit:
+        return text
+    if isinstance(value, str):
+        # Shorten inside the quotes so the line still reads as JSON.
+        return f'{text[:limit]}…" ({len(value)} chars)'
+    return f"{text[:limit]}… ({len(text)} chars)"
+
+
+def render_text(text: str, limit: int) -> str:
+    """Plain server text, escaped and bounded. Not JSON, so not quoted."""
+    text = safe(text)
+    if not limit or len(text) <= limit:
+        return text
+    return f"{text[:limit]}… ({len(text)} chars)"
+
+
+def render_properties(properties: Any, limit: int, indent: str) -> list[str]:
+    """A tool's parameters, one per line, as the server described them.
+
+    Each parameter keeps its whole subschema -- type, default, constraints,
+    and above all description, which is the text the model reads to decide
+    when to call the tool and what to pass it. That description is the
+    payload this tool exists to show, so it is not summarised away: a
+    parameter list of names and types would hide exactly the part that
+    reaches the model.
+
+    Which parameters are required is still the line below, as
+    inputSchema.required, where the server put it.
+    """
+    if not isinstance(properties, dict):
+        return [render(properties, limit)]
+    if not properties:
+        return ["{}"]
+    inner = indent + STEP
+    names = list(properties)
+    return (
+        ["{"]
+        + [f'{inner}"{safe(name)}": {render(properties[name], limit)}'
+           + ("," if position < len(names) - 1 else "")
+           for position, name in enumerate(names)]
+        + [f"{indent}}}"]
+    )
+
+
+# Fields whose value is opened out into a block rather than rendered on the
+# field's own line. A prompt's arguments are not among them: they carry their
+# own required flag, one per argument, so there is nothing to hoist out and
+# the list reads well enough as it came -- descriptions included.
+BLOCKS = {"inputSchema.properties": render_properties}
+
+
+# ---------------------------------------------------------------- transcript
+
+
+def marked(mark: str, lines: Iterable[str]) -> list[str]:
+    return [f"{mark} {line}" if line else mark for line in lines]
+
+
+def render_transcript(exchanges: list) -> str:
+    """The whole session as HTTP message text: "> " sent, "< " received, like
+    how curl -v and every RFC example write it.
+
+    Every line carries its prefix, bodies included, so no byte a server
+    sent can be read as a line this tool wrote; safe() then escapes
+    whatever a terminal would act on. The prefix is why bodies can be
+    printed as text at all. Splitting a body into lines is the one thing
+    this rendering does not preserve: CR, LF and CRLF all come out as a
+    line break. --json keeps the bodies unsplit.
+    """
+    blocks = []
+    for exchange in exchanges:
+        request, response = exchange["request"], exchange["response"]
+        start = f"{request['verb']} {request['url']} HTTP/1.1"
+        status = " ".join(str(part) for part in
+                          (response["version"], response["status"], response["reason"])
+                          if str(part).strip())
+        blocks.append("\n".join(
+            marked(">", [safe(oneline(start))]
+                        + header_lines(request["headers"])
+                        + [""] + body_lines(request["body"]))
+            + [""]
+            + marked("<", [safe(oneline(status))]
+                          + header_lines(response["headers"])
+                          + [""] + body_lines(response["body"]))
+        ))
+    return "\n\n".join(blocks)
+
+
+def header_lines(headers: dict) -> list[str]:
+    return [f"{safe(oneline(name))}: {safe(oneline(value))}"
+            for name, value in headers.items()]
+
+
+def body_lines(body: str | None) -> list[str]:
+    return [safe(line) for line in (body or "").splitlines()]
+
+
+def server_identity(info: dict) -> str | None:
+    """What the server calls itself, and which build: "demo-day v0.1.18".
+
+    The summary carries the short form. Whatever else serverInfo held is
+    in the result printed above, where the server sent it.
+    """
+    identity = info.get("serverInfo") or (info.get("_meta") or {}).get(META_SERVER_INFO)
+    if not isinstance(identity, dict):
+        return None
+    name = oneline(identity.get("name") or "")
+    version = oneline(identity.get("version") or "")
+    if version and not version.lower().startswith("v"):
+        version = f"v{version}"
+    return " ".join(part for part in (name, version) if part) or None
+
+
+# ---------------------------------------------------------------------- main
+
+
+SECTIONS = ("tools", "resources", "prompts")
+CHOICES = ("info",) + SECTIONS
+CAPABILITY = {"tools": "tools", "resources": "resources", "prompts": "prompts"}
+LIST_METHOD = {"tools": "tools/list", "resources": "resources/list", "prompts": "prompts/list"}
+TEMPLATES_METHOD = "resources/templates/list"
+
+
+def list_entries(transport: Transport, method: str, key: str,
+                 reporter: Reporter) -> tuple[int, list[str]]:
+    """Print every page of a list call, and return how many entries it held
+    and what they were called.
+
+    An entry with no name of its own is counted but not named, so a summary
+    that shows some of the names still accounts for all of the entries.
+    """
+    total, names = 0, []
+    for result in transport.paginate(method, key):
+        reporter.result(result, key)
+        entries = result.get(key) or []
+        total += len(entries)
+        for entry in entries:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if isinstance(name, str) and name.strip():
+                names.append(safe(oneline(name)))
+    return total, names
+
+
+def probe(transport: Transport, info: dict, kinds: Iterable[str], explicit: bool,
+          reporter: Reporter, outcome: dict) -> None:
+    """Issue each selected list call, recording what became of it."""
+    capabilities = info.get("capabilities") or {}
+    for kind in kinds:
+        method = LIST_METHOD[kind]
+        if not explicit and CAPABILITY[kind] not in capabilities:
+            reporter.skipped(method, "capability not advertised")
+            outcome[kind] = "not advertised"
+            continue
+        try:
+            outcome[kind] = list_entries(transport, method, kind, reporter)
+        except RpcError as error:
+            reporter.failure(error)
+            outcome[kind] = f"error {error.code} {oneline(error.message)}"
+            continue
+
+        if kind != "resources":
+            continue
+        # An optional method with no capability flag of its own: the only way
+        # to learn whether it exists is to ask.
+        try:
+            templates, _ = list_entries(transport, TEMPLATES_METHOD,
+                                        "resourceTemplates", reporter)
+        except RpcError as error:
+            reporter.failure(error)
+            continue
+        if templates:
+            outcome["templates"] = templates
+
+
+def fit_names(count: int, names: list[str], note: str, room: int) -> str:
+    """The count, then as many of the entry names as the row has room for.
+
+    A name is kept whole or left out, never cut through the middle, and
+    whatever did not fit is counted at the end, so the row cannot be read
+    as the whole list when it is not.
+    """
+    head, tail = str(count), f"; {note}" if note else ""
+    room -= len(head) + 3 + len(tail)   # the " (" and the ")"
+    shown: list[str] = []
+    for name in names:
+        left = count - len(shown) - 1
+        more = f", +{left} more" if left > 0 else ""
+        if len(", ".join(shown + [name])) + len(more) > room:
+            break
+        shown.append(name)
+    if not shown:
+        return f"{head} ({note})" if note else head
+    left = count - len(shown)
+    inner = ", ".join(shown) + (f", +{left} more" if left > 0 else "") + tail
+    return f"{head} ({inner})"
+
+
+def summarise(url: str, transport: Transport | None, info: dict | None,
+              kinds: Iterable[str], outcome: dict,
+              verdict: str = NO_HTTP) -> list[tuple[str, str]]:
+    """The closing block: where, how, who, and what they offered.
+
+    What each era means is fixed, and --help says it; what belongs here is
+    only what this run found. A probe that never reached an MCP server
+    found one thing -- which layer gave way -- and rows of "not reached"
+    under headings for services that were never in question say less than
+    that one line does.
+    """
+    rows = [("endpoint", url)]
+    if transport is None:
+        rows.append(("verdict", verdict))
+        return rows
+    rows.append(("protocol used", f"{transport.version} ({transport.era} era)"))
+    if transport.session_id:
+        rows.append(("session", transport.session_id))
+    identity = server_identity(info or {})
+    if identity:
+        rows.append(("server info", identity))
+    selected = set(kinds)
+    # Names have to fit the row they land in, which begins where the widest
+    # label ends -- the column Reporter.summary lays the values out to.
+    labels = [label for label, _ in rows] + list(SECTIONS)
+    room = max(20, wrap_width() - len(MARGIN) - max(map(len, labels)) - 2)
+    for kind in SECTIONS:
+        found = outcome.get(kind)
+        if isinstance(found, tuple):
+            count, names = found
+            found_templates = outcome.get("templates") if kind == "resources" else 0
+            note = (f"+{found_templates} template{'s' if found_templates > 1 else ''}"
+                    if found_templates else "")
+            rows.append((kind, fit_names(count, names, note, room)))
+        elif found is not None:
+            rows.append((kind, found))
+        elif kind in selected:
+            rows.append((kind, "not reached"))  # the probe stopped before it
+        else:
+            rows.append((kind, "not probed"))   # --request excluded it
+    return rows
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    """override class to put error message first and advertise --help"""
+    def error(self, message: str):
+        self.exit(2, f"{self.prog}: error: {message}\nTry --help for help.\n")
+
+
+def characters(value: str) -> int:
+    """A character count for --truncate. Rejected here so that a negative
+    one cannot reach a slice, where it would quietly cut from the end."""
+    try:
+        count = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value}") from None
+    if count < 0:
+        raise argparse.ArgumentTypeError(f"cannot be negative: {value}")
+    return count
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = ArgumentParser(
+        prog="mcp-probe",
+        add_help=False,
+        description="Probe what an MCP server offers (and what it injects into context)",
+        epilog="With no --request, every section is probed. "
+               "MCP_AUTH_TOKEN, if set, is sent as an Authorization: Bearer header. "
+               "--json holds only what the server sent: one entry per call, "
+               "envelope intact, pages unmerged. Include the HTTP layer and any "
+               "interleaved notifications with --transcript.",
+    )
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--json", "-j", action="store_true",
+                        help="emit the JSON-RPC responses as JSON, keyed by method")
+    output.add_argument("--transcript", "-t", action="store_true",
+                        help="emit full HTTP exchanges (> sent, < received)")
+    parser.add_argument("url", metavar="URL", help="MCP endpoint (http:// or https://)")
+    parser.add_argument("--request", "-r", action="append", dest="requests",
+                        choices=CHOICES, metavar="{info,tools,resources,prompts}",
+                        help="what to probe; repeatable (default: auto-detect)")
+    parser.add_argument("--era", "-e", choices=("auto", "modern", "legacy"), default="auto",
+                        help="protocol era to probe (default: auto-detect). "
+                             "modern = 2026-07-28 and later: stateless, "
+                             "per-request metadata, no handshake. "
+                             "legacy = 2025-11-25 and earlier: initialize "
+                             "handshake, then an Mcp-Session-Id header on "
+                             "every request")
+    parser.add_argument("--truncate", type=characters, default=TRUNCATE_DEFAULT,
+                        metavar="CHARS",
+                        help=f"truncate long values (default: {TRUNCATE_DEFAULT}; "
+                             "0 to never truncate)")
+    parser.add_argument("--header", action="append", default=[], metavar="'K: V'",
+                        help="extra request header; repeatable")
+    parser.add_argument("--timeout", type=float, default=30.0, metavar="SECONDS",
+                        help="per-request timeout (default: 30)")
+    parser.add_argument("--help", action="help",
+                        help="show this help message and exit")
+    parser.add_argument("--version", action="version",
+                        version=f"{CLIENT_INFO['name']} {CLIENT_INFO['version']}",
+                        help="show version number and exit")
+    return parser.parse_args(argv)
+
+
+def build_options(args: argparse.Namespace) -> Options:
+    if not args.url.startswith(("http://", "https://")):
+        raise ProbeError("URL must be http:// or https://")
+    headers = {}
+    token = os.environ.get("MCP_AUTH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    for raw in args.header:
+        name, separator, value = raw.partition(":")
+        if not separator:
+            raise ProbeError(f"malformed header: {raw}")
+        headers[name.strip()] = value.strip()
+    reporter = Reporter(enabled=not (args.json or args.transcript),
+                        limit=args.truncate)
+    return Options(url=args.url, timeout=args.timeout, extra_headers=headers,
+                   reporter=reporter)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        options = build_options(args)
+    except ProbeError as error:
+        print(f"mcp-probe: {safe(str(error))}", file=sys.stderr)
+        return 1
+
+    requested = args.requests or []
+    explicit = [kind for kind in SECTIONS if kind in requested]
+    kinds = explicit or ([] if "info" in requested else list(SECTIONS))
+
+    status = 0
+    transport: Transport | None = None
+    info: dict | None = None
+    outcome: dict = {}
+    # An RpcError that gets this far ended the handshake, which means the
+    # endpoint answered in JSON-RPC and declined in it too.
+    verdict = NO_MCP
+    try:
+        transport, info = detect(options, args.era)
+        probe(transport, info, kinds, bool(explicit), options.reporter, outcome)
+    except (ProbeError, RpcError) as error:
+        status = 1
+        verdict = getattr(error, "verdict", NO_MCP)
+        # The report is where a failure belongs, in the section that hit it
+        # and in the order it happened. stderr is for when there is no
+        # report to put it in: a usage error, or a raw mode whose stdout is
+        # a data stream that a message would corrupt.
+        if not getattr(error, "reported", False):
+            if options.reporter.enabled:
+                options.reporter.problem(oneline(str(error)))
+            else:
+                print(f"mcp-probe: {safe(oneline(str(error)))}", file=sys.stderr)
+    finally:
+        if transport is not None:
+            transport.close()
+
+    options.reporter.summary(
+        summarise(args.url, transport, info, kinds, outcome, verdict))
+
+    # Emitted even when the probe failed: a refusal is what you most want to
+    # read. For --json, ensure_ascii escapes every control and bidi
+    # character while staying valid, lossless JSON for whatever consumes it;
+    # render_transcript does the same job with safe().
+    if args.transcript:
+        if options.journal.exchanges:
+            print(render_transcript(options.journal.exchanges))
+    elif args.json:
+        print(json.dumps(options.journal.by_method(), indent=2, ensure_ascii=True))
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())
