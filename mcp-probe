@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Probe what an MCP server offers (and what it injects into context)
+Probe what an MCP server offers (and see what it injects into context)
 Author: Jeremy Dolan/Claude-Opus-5 on 2026-08-16
 
 Speaks both eras of the Streamable HTTP transport:
@@ -36,6 +36,7 @@ the terminal is escaped first; see safe() below.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import shutil
@@ -48,9 +49,20 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
-CLIENT_INFO = {"name": "mcp-probe", "version": "0.2"}
+CLIENT_INFO = {"name": "mcp-probe", "version": "0.3"}
 # urllib's default announces Python-urllib, which edge filters block on sight.
 USER_AGENT = f"{CLIENT_INFO['name']}/{CLIENT_INFO['version']}"
+
+# What this tool sends on its own, before the caller adds anything to it.
+# A cross-origin redirect falls back to these, because a --header may
+# override one of them rather than add a new one: dropping the caller's
+# User-Agent must not leave urllib to supply its own, and dropping their
+# Accept must not leave the request with no Accept at all.
+BASE_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    "User-Agent": USER_AGENT,
+}
 
 MODERN_VERSION = "2026-07-28"
 LEGACY_VERSION = "2025-11-25"
@@ -185,7 +197,8 @@ class Response:
     status: int
     headers: Any
     body: bytes
-    # Redirects followed before this reply, as (status, destination) pairs.
+    # Redirects followed before this reply, as (status, destination, note)
+    # triples; the note says what the hop cost, and is usually empty.
     hops: list = field(default_factory=list)
     reason: str = ""
     version: str = "HTTP/1.1"
@@ -200,6 +213,44 @@ class Response:
 
 
 # --------------------------------------------------------------------- HTTP
+
+
+# Headers that authenticate a request rather than describe it. A redirect
+# to another origin hands the request to a different party, and the whole
+# point of a bearer token is that whoever holds it can spend it, so these do
+# not travel across one.
+#
+# Mcp-Session-Id is deliberately not here. It is not the caller's secret but
+# the server's own handle, and the server holding it is whichever one
+# answered initialize -- which, behind a redirect, is the origin at the far
+# end. Withholding it there would withhold it from the only party it means
+# anything to, and the probe would be refused for want of a session it was
+# already holding.
+CREDENTIAL_HEADERS = frozenset(("authorization", "cookie",
+                                "proxy-authorization"))
+
+# The only schemes a redirect may name. urllib's default opener will happily
+# open file: and ftp: URLs, so a server that answers a probe with
+# "Location: file:///etc/passwd" would otherwise have this tool read a local
+# file and carry it into the journal.
+REDIRECT_SCHEMES = frozenset(("http", "https"))
+
+
+def origin(url: str) -> tuple:
+    """Scheme, host and port, with the default port spelled out.
+
+    What "the same party" means for a credential. A hop that changes any of
+    the three goes somewhere else, and an https -> http hop goes there over
+    a wire anyone on the path can read.
+    """
+    parts = urllib.parse.urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        port = None  # a malformed port: not an origin, so not a matching one
+    if port is None:
+        port = {"http": 80, "https": 443}.get(parts.scheme)
+    return (parts.scheme, (parts.hostname or "").lower(), port)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -229,7 +280,21 @@ def sent(request: urllib.request.Request) -> dict:
 
 
 def http_post(url: str, payload: dict, headers: dict, timeout: float,
-              journal: "Journal | None" = None) -> Response:
+              journal: "Journal | None" = None,
+              sensitive: frozenset = frozenset()) -> Response:
+    """POST the payload, following redirects by hand.
+
+    Redirects are where a probe can be turned against whoever is running
+    it: the destination is the server's to choose, and it is chosen after
+    the credentials have already been handed over once. So only http and
+    https are followed, and nothing that authenticates the request crosses
+    to an origin other than the one it was meant for. What was dropped is
+    named on the hop, because the next reply may well be a 401 and the
+    reason for it belongs in the report.
+
+    sensitive names the headers to drop, lowercased, on top of the ones
+    that are always credentials.
+    """
     text = json.dumps(payload)
     body = text.encode()
     hops: list = []
@@ -248,14 +313,40 @@ def http_post(url: str, payload: dict, headers: dict, timeout: float,
             raise ProbeError(f"no reply: {exc.reason}") from None
         except OSError as exc:
             raise ProbeError(f"no reply: {exc}") from None
+        except http.client.HTTPException as exc:
+            # Not an OSError, and raised before urllib wraps anything: a
+            # Location naming a port that is not a number lands here, and
+            # the Location is the server's to write.
+            raise ProbeError(f"no reply: {type(exc).__name__}: {exc}") from None
 
         if journal is not None:
             journal.record("POST", url, sent(request), text, response)
 
         location = response.headers.get("Location")
         if response.status in (301, 302, 303, 307, 308) and location:
-            url = urllib.parse.urljoin(url, location)
-            hops.append((response.status, url))
+            target = urllib.parse.urljoin(url, location)
+            if urllib.parse.urlsplit(target).scheme not in REDIRECT_SCHEMES:
+                # Something did answer, and what it answered with was a
+                # redirect carrying no JSON-RPC message. That is the verdict,
+                # not silence.
+                raise ProbeError(
+                    f"refused redirect to {target}: "
+                    "only http and https are followed", verdict=NO_JSONRPC)
+            note = ""
+            if origin(target) != origin(url):
+                drop = {name for name in headers
+                        if name.lower() in (CREDENTIAL_HEADERS | sensitive)}
+                if drop:
+                    headers = {name: value for name, value in headers.items()
+                               if name not in drop}
+                    # A dropped header may have been an override rather than
+                    # an addition, so what this tool would have sent on its
+                    # own takes its place.
+                    for name, value in BASE_HEADERS.items():
+                        headers.setdefault(name, value)
+                    note = f"not sent to another origin: {', '.join(sorted(drop))}"
+            url = target
+            hops.append((response.status, url, note))
             continue
         response.hops = hops
         return response
@@ -443,8 +534,11 @@ class Reporter:
         """The status line as HTTP wrote it: code, reason, content type."""
         if not self.enabled:
             return
-        for status, destination in response.hops:
-            self.write(f"<= {status} → {safe(oneline(destination))}")
+        for status, destination, note in response.hops:
+            line = f"<= {status} → {safe(oneline(destination))}"
+            if note:
+                line += f"  ({safe(oneline(note))})"
+            self.write(line)
         line = f"<= {response.status}"
         if response.reason:
             line += f" {safe(oneline(response.reason))}"
@@ -609,12 +703,19 @@ class Options:
     journal: Journal = field(default_factory=Journal)
     reporter: Reporter = field(default_factory=Reporter)
 
+    @property
+    def sensitive(self) -> frozenset:
+        """Header names that must not cross to another origin.
+
+        Every header the caller supplied, not just the ones named
+        CREDENTIAL_HEADERS: --header is the documented way to pass an
+        X-Api-Key or anything else this tool has no name for, and a name
+        it has no name for is exactly the one it cannot clear as harmless.
+        """
+        return frozenset(name.lower() for name in self.extra_headers)
+
     def headers(self, **overrides: str) -> dict:
-        merged = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "User-Agent": USER_AGENT,
-        }
+        merged = dict(BASE_HEADERS)
         merged.update(overrides)
         merged.update(self.extra_headers)
         return merged
@@ -640,7 +741,8 @@ class Transport:
         self.reporter.request("POST", method, params)
         try:
             response = http_post(self.options.url, payload, headers,
-                                 self.options.timeout, self.options.journal)
+                                 self.options.timeout, self.options.journal,
+                                 self.options.sensitive)
         except ProbeError as error:
             # Nothing came back at all, so the section has no reply line;
             # say why here rather than leaving it hanging.
@@ -758,7 +860,8 @@ class LegacyTransport(Transport):
         self.reporter.request("POST", method)
         try:
             response = http_post(self.options.url, payload, self.headers(),
-                                 self.options.timeout, self.options.journal)
+                                 self.options.timeout, self.options.journal,
+                                 self.options.sensitive)
         except ProbeError:
             self.reporter.note("no reply (notifications are not acknowledged)")
             return
@@ -875,8 +978,7 @@ def detect(options: Options, era: str) -> tuple[Transport, dict]:
         options.reporter.failure(
             RpcError(code or 0, error.get("message", "error"), error.get("data")))
         if code == UNSUPPORTED_PROTOCOL_VERSION:
-            supported = (error.get("data") or {}).get("supported") or []
-            return retry_with_supported(options, era, supported)
+            return retry_with_supported(options, era, offered_versions(error))
         if code in MODERN_ERRORS:
             # Modern server, but it rejected the request for another reason.
             reported = options.reporter.problem("server/discover was rejected")
@@ -913,6 +1015,22 @@ def detect(options: Options, era: str) -> tuple[Transport, dict]:
 
     transport = LegacyTransport(options)
     return transport, transport.describe()
+
+
+def offered_versions(error: dict) -> list:
+    """The versions named by an UNSUPPORTED_PROTOCOL_VERSION error.
+
+    All of it is the server's to shape, and the servers this tool is
+    pointed at are the ones whose shape is in question: data need not be
+    an object, supported need not be a list, and what is in it need not be
+    a string that compares against a date. Only the strings survive here,
+    because only a string was ever a version this tool could ask for.
+    """
+    data = error.get("data")
+    offered = data.get("supported") if isinstance(data, dict) else None
+    if not isinstance(offered, list):
+        return []
+    return [version for version in offered if isinstance(version, str)]
 
 
 def retry_with_supported(options: Options, era: str, supported: list) -> tuple[Transport, dict]:
@@ -1241,11 +1359,33 @@ def characters(value: str) -> int:
     return count
 
 
+def endpoint(value: str) -> str:
+    """The URL to probe. Checked here, alongside every other argument, so
+    that a scheme this tool cannot speak is answered as the usage error it
+    is rather than as a probe that failed."""
+    if not value.startswith(("http://", "https://")):
+        raise argparse.ArgumentTypeError(f"must be http:// or https://: {value}")
+    return value
+
+
+def header(value: str) -> tuple:
+    """One "Name: value" header, split where the caller wrote the colon.
+
+    Split here rather than after parsing, for the same reason: a header
+    with no name to it never reaches a request, and saying so is the
+    parser's job.
+    """
+    name, separator, text = value.partition(":")
+    if not separator or not name.strip():
+        raise argparse.ArgumentTypeError(f"malformed header: {value}")
+    return (name.strip(), text.strip())
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = ArgumentParser(
         prog="mcp-probe",
         add_help=False,
-        description="Probe what an MCP server offers (and what it injects into context)",
+        description="Probe what an MCP server offers (and see what it injects into context)",
         epilog="With no --request, every section is probed. "
                "MCP_AUTH_TOKEN, if set, is sent as an Authorization: Bearer header. "
                "--json holds only what the server sent: one entry per call, "
@@ -1257,7 +1397,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="emit the JSON-RPC responses as JSON, keyed by method")
     output.add_argument("--transcript", "-t", action="store_true",
                         help="emit full HTTP exchanges (> sent, < received)")
-    parser.add_argument("url", metavar="URL", help="MCP endpoint (http:// or https://)")
+    parser.add_argument("url", metavar="URL", type=endpoint,
+                        help="MCP endpoint (http:// or https://)")
     parser.add_argument("--request", "-r", action="append", dest="requests",
                         choices=CHOICES, metavar="{info,tools,resources,prompts}",
                         help="what to probe; repeatable (default: auto-detect)")
@@ -1272,8 +1413,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         metavar="CHARS",
                         help=f"truncate long values (default: {TRUNCATE_DEFAULT}; "
                              "0 to never truncate)")
-    parser.add_argument("--header", action="append", default=[], metavar="'K: V'",
-                        help="extra request header; repeatable")
+    parser.add_argument("--header", action="append", default=[], type=header,
+                        metavar="'K: V'", help="extra request header; repeatable")
     parser.add_argument("--timeout", type=float, default=30.0, metavar="SECONDS",
                         help="per-request timeout (default: 30)")
     parser.add_argument("--help", action="help",
@@ -1285,17 +1426,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_options(args: argparse.Namespace) -> Options:
-    if not args.url.startswith(("http://", "https://")):
-        raise ProbeError("URL must be http:// or https://")
     headers = {}
     token = os.environ.get("MCP_AUTH_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    for raw in args.header:
-        name, separator, value = raw.partition(":")
-        if not separator:
-            raise ProbeError(f"malformed header: {raw}")
-        headers[name.strip()] = value.strip()
+    # Later --header wins, including over the token, so that a caller who
+    # spells out an Authorization header gets the one they spelled out.
+    headers.update(args.header)
     reporter = Reporter(enabled=not (args.json or args.transcript),
                         limit=args.truncate)
     return Options(url=args.url, timeout=args.timeout, extra_headers=headers,
@@ -1304,11 +1441,7 @@ def build_options(args: argparse.Namespace) -> Options:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    try:
-        options = build_options(args)
-    except ProbeError as error:
-        print(f"mcp-probe: {safe(str(error))}", file=sys.stderr)
-        return 1
+    options = build_options(args)
 
     requested = args.requests or []
     explicit = [kind for kind in SECTIONS if kind in requested]

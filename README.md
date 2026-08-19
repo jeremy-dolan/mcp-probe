@@ -1,16 +1,20 @@
 # mcp-probe
 
-Probe what an MCP server offers (and what it injects into context)
+Probe what an MCP server offers (and see what it injects into context)
 
-mcp-probe will query an MCP endpoint over HTTP, reporting general information
-as well as available features (tools, resources, prompts). Produces a summary,
-JSON for parsing, or a full HTTP transcript for debugging (see Usage, below).
-Autodetects between modern (>= 2026-07-28) and legacy (<= 2025-11-25) MCP
-protocols.
+mcp-probe will query an MCP endpoint over HTTP(S), reporting general server
+information as well as available features (tools, resources, and prompts).
+mcp-probe can output either a friendly summary (default), JSON for machine
+parsing (`--json`), or a full HTTP transcript for debugging (`--transcript`).
+mcp-probe speaks both the modern, stateless protocol (versions >= 2026-07-28)
+as well as legacy mode (<= 2025-11-25).
 
-> [!CAUTION]  
-> `MCP_AUTH_TOKEN`, if set, is sent as an `Authorization: Bearer` header.
-> It is *not* redacted from --transcript output.
+> [!NOTE]  
+> `MCP_AUTH_TOKEN`, if set, will be sent as an `Authorization: Bearer` header.
+> Also note that it is *not* redacted from --transcript output, so careful when
+> pasting. To prevent leakage, credentials will not cross to a different origin
+> (*i.e.*, a redirect that changes scheme, host, or port will drop the
+> `Authorization` header and any custom `--header` you passed).
 
 Public domain (under [CC0](https://creativecommons.org/publicdomain/zero/1.0/)).
 
@@ -114,7 +118,7 @@ mcp-probe [--json | --transcript] [--request {info,tools,resources,prompts}]
 | `--header` | extra request header; repeatable |
 | `--timeout` | per-request timeout in seconds (default 30) |
 
-Exit status is 0 when the probe completed, 1 when it failed, 2 on a usage error.
+Exit status: 0 when the probe completes, 1 when it fails, 2 on a usage error.
 
 ## When it fails
 
