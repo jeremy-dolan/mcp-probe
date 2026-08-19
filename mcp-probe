@@ -103,7 +103,11 @@ TRUNCATE_DEFAULT = 500
 # Nesting steps by two from there, as JSON is usually written.
 MARGIN = "   "
 STEP = "  "
-RULE = "─" * 62
+# The stroke a section rule is drawn from. Box drawing rather than an em
+# dash: it is built to touch both cell edges, so a run of it reads as one
+# unbroken line, and most terminals draw this range themselves rather than
+# leaving it to the font.
+STROKE = "─"
 
 # Field order follows the MCP schema; unknown fields are appended verbatim.
 # A dotted name reports a nested value under its own path, so that what the
@@ -465,6 +469,18 @@ def fold(line: str) -> list[str]:
                          break_on_hyphens=False) or [line]
 
 
+def banner(title: str) -> str:
+    """A rule that names the block it opens, run out to the terminal edge.
+
+    One stroke before the title, so the word does not start at column zero
+    where this tool's markers live, then stroke to the end of the row.
+    Measured per call, as fold() is, so a report that outlives a resize
+    follows it.
+    """
+    opening = f"{STROKE}{title}"
+    return opening + STROKE * max(0, wrap_width() - len(opening))
+
+
 def dig(item: dict, path: str) -> Any:
     """The value at a dotted path, or None if any step of it is missing."""
     value: Any = item
@@ -686,7 +702,7 @@ class Reporter:
         if not self.enabled or not rows:
             return
         self.write()
-        self.write(RULE)
+        self.write(banner("SUMMARY"))
         width = max(len(label) for label, _ in rows)
         for label, value in rows:
             self.write(f"{MARGIN}{label.ljust(width)}  {safe(oneline(str(value)))}")

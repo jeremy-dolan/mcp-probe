@@ -91,7 +91,7 @@ $ mcp-probe https://example.com/mcp
 
 -- prompts/list request not sent (capability not advertised)
 
-──────────────────────────────────────────────────────────────
+─SUMMARY───────────────────────────────────────────────────────────────────────
    endpoint       https://example.com/mcp
    protocol used  2025-11-25 (legacy era)
    server info    Example Doc Server v1.0.0
