@@ -21,11 +21,14 @@ A summary of services found closes the report.
 
 Additionally, two data streaming modes are available:
 
-  --json       JSON-RPC responses as JSON, grouped under the method that asked
-               for it, one entry per call: a list that arrived in pages has one
-               entry per page. Each entry is the whole response, jsonrpc and id
-               included, not just the payload. Server notifications are not
-               replies and do not appear here
+  --json       server replies as JSON, grouped under the method that asked for
+               them, one entry per method: a list that arrived in pages comes
+               back collated, without the spent cursor. A nextCursor that does
+               survive means paging stopped early and the list is short.
+               Entries keep jsonrpc and result, or error if any call failed,
+               but not id, which is this tool's own counter rather than
+               anything the server said. Server notifications are not replies
+               and do not appear here
   --transcript every HTTP exchange as HTTP message text, the way curl -v writes
                it: "> " is what was sent, "< " is what came back, headers and
                bodies exactly as they went over the wire, nothing withheld --
@@ -163,6 +166,45 @@ class RpcError(Exception):
         return f"{where}{oneline(self.message)} (code {self.code})"
 
 
+def merge_replies(pages: list) -> dict:
+    """Fold one method's replies into the single reply they stood for.
+
+    Paging is a transport detail: three tools delivered two at a time are
+    still three tools, and the cursor that carried them is spent by the
+    time anyone reads this. So list values concatenate in call order,
+    everything else keeps the first page's value, and nextCursor is left
+    behind. --transcript still has each page as it arrived.
+
+    Unless the last page still names one. Then paging stopped early --
+    MAX_PAGES -- and the cursor is not spent but live, the handle to what
+    was never fetched. Dropping it there would be the whole reason for
+    merging turned upside down: a list cut short, reported as complete.
+
+    An error anywhere discards the pages that succeeded, because a short
+    list that looks whole is a worse answer than the failure that made it.
+
+    id is dropped: it is our own counter (see Transport.request_id), not
+    anything the server said, and there is nothing left to correlate once
+    the replies are keyed by method.
+    """
+    for page in pages:
+        if isinstance(page.get("error"), dict):
+            return {"jsonrpc": page.get("jsonrpc", "2.0"), "error": page["error"]}
+    merged: dict = {}
+    for page in pages:
+        for key, value in (page.get("result") or {}).items():
+            if key == "nextCursor":
+                continue
+            if key not in merged:
+                merged[key] = list(value) if isinstance(value, list) else value
+            elif isinstance(merged[key], list) and isinstance(value, list):
+                merged[key].extend(value)
+    unfetched = (pages[-1].get("result") or {}).get("nextCursor")
+    if unfetched:
+        merged["nextCursor"] = unfetched
+    return {"jsonrpc": pages[0].get("jsonrpc", "2.0"), "result": merged}
+
+
 @dataclass
 class Journal:
     """Verbatim record of every HTTP exchange, for --transcript.
@@ -181,10 +223,12 @@ class Journal:
         self.messages.append((method, message))
 
     def by_method(self) -> dict:
+        """One entry per method, its pages folded back into a single reply."""
         grouped: dict = {}
         for method, message in self.messages:
             grouped.setdefault(method, []).append(message)
-        return grouped
+        return {method: merge_replies(pages)
+                for method, pages in grouped.items()}
 
     def record(self, verb: str, url: str, headers: dict, body: str | None,
                response: "Response") -> None:
@@ -1441,7 +1485,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", "-j", action="store_true",
-                        help="JSON-RPC responses as JSON, keyed by method, one entry per call")
+                        help="server replies as JSON (keyed by method; pages collated)")
     output.add_argument("--transcript", "-t", action="store_true",
                         help="verbatim HTTP exchanges including credentials (> sent, < received)")
     parser.add_argument("url", metavar="URL", type=endpoint,
