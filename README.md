@@ -110,7 +110,7 @@ mcp-probe [--json | --transcript] [--request {info,tools,resources,prompts}]
 
 | Option | |
 | --- | --- |
-| `--json`, `-j` | every JSON-RPC response as JSON, envelope intact, keyed by method |
+| `--json`, `-j` | JSON-RPC responses as JSON, keyed by method, one entry per call |
 | `--transcript`, `-t` | verbatim HTTP exchanges including credentials (`>` sent, `<` received) |
 | `--request`, `-r` | probe this section even if unadvertised; repeatable (default: auto-detect) |
 | `--era`, `-e` | protocol era to probe (default: auto-detect). `modern` = 2026-07-28 and later: stateless, per-request metadata, no handshake. `legacy` = 2025-11-25 and earlier: `initialize` handshake, then an `Mcp-Session-Id` header on every request |

@@ -19,7 +19,7 @@ _mcp-probe() {
   # --json and --transcript each replace the report with a data stream, so
   # neither can follow the other. --help and --version each end the line.
   _arguments -s -S -C \
-    '(--json -j --transcript -t)'{--json,-j}'[every JSON-RPC response as JSON, envelope intact, keyed by method]' \
+    '(--json -j --transcript -t)'{--json,-j}'[JSON-RPC responses as JSON, keyed by method, one entry per call]' \
     '(--json -j --transcript -t)'{--transcript,-t}'[verbatim HTTP exchanges including credentials (> sent, < received)]' \
     \*{--request=,-r+}'[probe this section even if unadvertised; repeatable (default: auto-detect)]:section:->section' \
     '(--era -e)'{--era=,-e+}'[protocol era to probe (default: auto-detect)]:era:->era' \

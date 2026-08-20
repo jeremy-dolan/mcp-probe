@@ -21,8 +21,10 @@ A summary of services found closes the report.
 
 Additionally, two data streaming modes are available:
 
-  --json       every JSON-RPC response as JSON, envelope intact, grouped under
-               the method that asked for it. Server notifications are not
+  --json       JSON-RPC responses as JSON, grouped under the method that asked
+               for it, one entry per call: a list that arrived in pages has one
+               entry per page. Each entry is the whole response, jsonrpc and id
+               included, not just the payload. Server notifications are not
                replies and do not appear here
   --transcript every HTTP exchange as HTTP message text, the way curl -v writes
                it: "> " is what was sent, "< " is what came back, headers and
@@ -175,7 +177,7 @@ class Journal:
     messages: list = field(default_factory=list)
 
     def record_message(self, method: str, message: dict) -> None:
-        """Keep the reply to one call, envelope intact, for --json."""
+        """Keep one call's whole reply, not just the payload, for --json."""
         self.messages.append((method, message))
 
     def by_method(self) -> dict:
@@ -1439,7 +1441,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", "-j", action="store_true",
-                        help="every JSON-RPC response as JSON, envelope intact, keyed by method")
+                        help="JSON-RPC responses as JSON, keyed by method, one entry per call")
     output.add_argument("--transcript", "-t", action="store_true",
                         help="verbatim HTTP exchanges including credentials (> sent, < received)")
     parser.add_argument("url", metavar="URL", type=endpoint,
