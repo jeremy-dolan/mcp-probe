@@ -1363,6 +1363,32 @@ class ArgumentParser(argparse.ArgumentParser):
         self.exit(2, f"{self.prog}: error: {message}\nTry --help for help.\n")
 
 
+class HelpFormatter(argparse.HelpFormatter):
+    """Keep --help and --version in the usage line but out of the option list.
+
+    Both are in every CLI and neither says anything about this one, so the
+    list is left to the options that do. This is the only hook that sees the
+    list without seeing the usage line: the usage line is formatted straight
+    from the parser's actions, so it still names them. argparse.SUPPRESS
+    would have taken them out of both.
+    """
+    def add_argument(self, action):
+        if not {"--help", "--version"}.intersection(action.option_strings):
+            super().add_argument(action)
+
+    def _fill_text(self, text, width, indent):
+        """Keep text that was laid out by hand, wrap text that was not.
+
+        The epilog is two labelled sections and has to survive as written;
+        RawDescriptionHelpFormatter would do that but would also stop the
+        one-line description from wrapping on a narrow terminal. Having a
+        newline in it is what marks text as already laid out.
+        """
+        if "\n" not in text:
+            return super()._fill_text(text, width, indent)
+        return "".join(indent + line for line in text.splitlines(keepends=True))
+
+
 def characters(value: str) -> int:
     """A character count for --truncate. Rejected here so that a negative
     one cannot reach a slice, where it would quietly cut from the end."""
@@ -1401,23 +1427,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = ArgumentParser(
         prog="mcp-probe",
         add_help=False,
+        formatter_class=HelpFormatter,
         description="Probe what an MCP server offers (and see what it injects into context)",
-        epilog="With no --request, every section is probed. "
-               "MCP_AUTH_TOKEN, if set, is sent as an Authorization: Bearer header. "
-               "--json holds only what the server sent: one entry per call, "
-               "envelope intact, pages unmerged. Include the HTTP layer and any "
-               "interleaved notifications with --transcript.",
+        epilog="environment:\n"
+               "  MCP_AUTH_TOKEN  if set, sent as an Authorization: Bearer header\n"
+               "\n"
+               "exit status:\n"
+               "  0  the probe completed\n"
+               "  1  the probe failed\n"
+               "  2  usage error",
     )
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", "-j", action="store_true",
-                        help="emit the JSON-RPC responses as JSON, keyed by method")
+                        help="every JSON-RPC response as JSON, envelope intact, keyed by method")
     output.add_argument("--transcript", "-t", action="store_true",
-                        help="emit full HTTP exchanges (> sent, < received)")
+                        help="verbatim HTTP exchanges including credentials (> sent, < received)")
     parser.add_argument("url", metavar="URL", type=endpoint,
                         help="MCP endpoint (http:// or https://)")
     parser.add_argument("--request", "-r", action="append", dest="requests",
                         choices=CHOICES, metavar="{info,tools,resources,prompts}",
-                        help="what to probe; repeatable (default: auto-detect)")
+                        help="probe this section even if unadvertised; repeatable (default: auto-detect)")
     parser.add_argument("--era", "-e", choices=("auto", "modern", "legacy"), default="auto",
                         help="protocol era to probe (default: auto-detect). "
                              "modern = 2026-07-28 and later: stateless, "
@@ -1432,7 +1461,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--header", action="append", default=[], type=header,
                         metavar="'K: V'", help="extra request header; repeatable")
     parser.add_argument("--timeout", type=float, default=30.0, metavar="SECONDS",
-                        help="per-request timeout (default: 30)")
+                        help="per-request timeout in seconds (default: 30)")
     parser.add_argument("--help", action="help",
                         help="show this help message and exit")
     parser.add_argument("--version", action="version",

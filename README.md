@@ -104,21 +104,21 @@ $ mcp-probe https://example.com/mcp
 
 ```
 mcp-probe [--json | --transcript] [--request {info,tools,resources,prompts}]
-          [--era {auto,modern,legacy}] [--timeout SECONDS] [--truncate CHARS]
-          [--header 'K: V']... [--help] [--version]  URL
+          [--era {auto,modern,legacy}] [--truncate CHARS] [--header 'K: V']
+          [--timeout SECONDS] [--help] [--version]  URL
 ```
 
 | Option | |
 | --- | --- |
-| `--request`, `-r` | probe only this section — `info`, `tools`, `resources`, `prompts`. Repeatable; default is all |
-| `--era`, `-e` | `auto` (default), `modern`, or `legacy` |
-| `--json`, `-j` | every JSON-RPC response as JSON, envelope intact, grouped by the method that asked for it |
-| `--transcript`, `-t` | every HTTP exchange as HTTP message text, the way `curl -v` writes it: `>` sent, `<` received, verbatim and unredacted — including any credentials sent |
-| `--truncate` | cut long values short at this many characters (default 500; `0` never truncates) |
+| `--json`, `-j` | every JSON-RPC response as JSON, envelope intact, keyed by method |
+| `--transcript`, `-t` | verbatim HTTP exchanges including credentials (`>` sent, `<` received) |
+| `--request`, `-r` | probe this section even if unadvertised; repeatable (default: auto-detect) |
+| `--era`, `-e` | protocol era to probe (default: auto-detect). `modern` = 2026-07-28 and later: stateless, per-request metadata, no handshake. `legacy` = 2025-11-25 and earlier: `initialize` handshake, then an `Mcp-Session-Id` header on every request |
+| `--truncate` | truncate long values (default: 500; `0` to never truncate) |
 | `--header` | extra request header; repeatable |
-| `--timeout` | per-request timeout in seconds (default 30) |
+| `--timeout` | per-request timeout in seconds (default: 30) |
 
-Exit status: 0 when the probe completes, 1 when it fails, 2 on a usage error.
+Exit status is 0 if the probe completes, 1 if it fails, 2 on a usage error.
 
 ## When it fails
 
@@ -133,23 +133,14 @@ naming the layer that gave way, in place of the service summary.
 | `JSON-RPC works here, but no MCP` | JSON-RPC answered, but no MCP method did |
 | `an MCP server, but it refused this probe` | MCP, but it rejected the request |
 
-## Protocol eras
-
-Both eras of the Streamable HTTP transport are spoken, and `--era auto`
-detects which one is in front of it:
-
-- **modern** — 2026-07-28 and later: stateless, per-request metadata, no
-  handshake. Identity and capabilities come from `server/discover`.
-- **legacy** — 2025-11-25 and earlier: `initialize` handshake,
-  `notifications/initialized`, then `Mcp-Session-Id` on every request.
-
 ## Install
 
-Python 3.9+, standard library only. Just put mcp-probe in your path and,
-optionally, \_mcp-probe in zsh's fpath:
+Python 3.9+, no third-party dependencies. Just drop `mcp-probe` in your PATH
+and, optionally, `_mcp-probe` in zsh's FPATH. E.g.:
 
 ```
-git clone https://github.com/jeremy-dolan/mcp-probe.git ~/.local/share/mcp-probe
-ln -s ~/.local/share/mcp-probe/mcp-probe ~/.local/bin/
-ln -s ~/.local/share/mcp-probe/completions/zsh/_mcp-probe ~/.zsh/completions/
+INSTALL_PATH=~/.local/share/mcp-probe
+git clone https://github.com/jeremy-dolan/mcp-probe.git $INSTALL_PATH
+ln -s $INSTALL_PATH/mcp-probe ~/.local/bin/
+ln -s $INSTALL_PATH/completions/zsh/_mcp-probe ~/.zsh/completions/
 ```
