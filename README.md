@@ -1,6 +1,6 @@
 # mcp-probe
 
-Probe what an MCP server offers (and see what it injects into context)
+Probe what an MCP server offers (and see what it injects into context).
 
 mcp-probe will query an MCP endpoint over HTTP(S), reporting general server
 information as well as available features (tools, resources, and prompts).
@@ -16,11 +16,41 @@ as well as legacy mode (<= 2025-11-25).
 > (*i.e.*, a redirect that changes scheme, host, or port will drop the
 > `Authorization` header and any custom `--header` you passed).
 
-Public domain (under [CC0](https://creativecommons.org/publicdomain/zero/1.0/)).
+Public domain under [CC0](https://creativecommons.org/publicdomain/zero/1.0/).
 
----
+## Usage
 
-Default mode example:
+```
+mcp-probe [--json | --transcript] [--request {info,tools,resources,prompts}]
+          [--era {auto,modern,legacy}] [--truncate CHARS] [--header 'K: V']
+          [--timeout SECONDS] [--help] [--version]  URL
+```
+
+| Option | |
+| --- | --- |
+| `--json`, `-j` | server replies as JSON (keyed by method; pages collated) |
+| `--transcript`, `-t` | verbatim HTTP exchanges including credentials (`>` sent, `<` received) |
+| `--request`, `-r` | probe this section even if unadvertised; repeatable (default: auto-detect) |
+| `--era`, `-e` | protocol era to probe (default: auto-detect). `modern` = 2026-07-28 and later: stateless, per-request metadata, no handshake. `legacy` = 2025-11-25 and earlier: `initialize` handshake, then an `Mcp-Session-Id` header on every request |
+| `--truncate` | truncate long values (default: 500; 0 to never truncate) |
+| `--header` | extra request header; repeatable |
+| `--timeout` | per-request timeout in seconds (default: 30) |
+
+Exit status is 0 if the probe completes, 1 if it fails, 2 on a usage error.
+
+## Install
+
+No third-party dependencies besides Python 3.9+. Drop `mcp-probe` in your PATH
+(and, optionally, `_mcp-probe` in zsh's FPATH). E.g.:
+
+```
+INSTALL_PATH=~/.local/share/mcp-probe
+git clone https://github.com/jeremy-dolan/mcp-probe.git $INSTALL_PATH
+ln -s $INSTALL_PATH/mcp-probe ~/.local/bin/
+ln -s $INSTALL_PATH/completions/zsh/_mcp-probe ~/.zsh/completions/
+```
+
+## Example (default mode)
 
 ```
 $ mcp-probe https://example.com/mcp
@@ -98,49 +128,4 @@ $ mcp-probe https://example.com/mcp
    tools          2 (search, read_docs)
    resources      1 (api-reference)
    prompts        not advertised
-```
-
-## Usage
-
-```
-mcp-probe [--json | --transcript] [--request {info,tools,resources,prompts}]
-          [--era {auto,modern,legacy}] [--truncate CHARS] [--header 'K: V']
-          [--timeout SECONDS] [--help] [--version]  URL
-```
-
-| Option | |
-| --- | --- |
-| `--json`, `-j` | server replies as JSON (keyed by method; pages collated) |
-| `--transcript`, `-t` | verbatim HTTP exchanges including credentials (`>` sent, `<` received) |
-| `--request`, `-r` | probe this section even if unadvertised; repeatable (default: auto-detect) |
-| `--era`, `-e` | protocol era to probe (default: auto-detect). `modern` = 2026-07-28 and later: stateless, per-request metadata, no handshake. `legacy` = 2025-11-25 and earlier: `initialize` handshake, then an `Mcp-Session-Id` header on every request |
-| `--truncate` | truncate long values (default: 500; `0` to never truncate) |
-| `--header` | extra request header; repeatable |
-| `--timeout` | per-request timeout in seconds (default: 30) |
-
-Exit status is 0 if the probe completes, 1 if it fails, 2 on a usage error.
-
-## When it fails
-
-MCP needs three layers to hold: HTTP, then JSON-RPC over it, then MCP over
-that. A probe that never reaches an MCP server closes with a single verdict
-naming the layer that gave way, in place of the service summary.
-
-| Verdict | |
-| --- | --- |
-| `nothing answered at this URL` | nothing came back over HTTP |
-| `no JSON-RPC here, so no MCP` | HTTP answered, but with no JSON-RPC message — the `!!` line above says whether the reply was refused, empty, not JSON, or JSON that is not a JSON-RPC message |
-| `JSON-RPC works here, but no MCP` | JSON-RPC answered, but no MCP method did |
-| `an MCP server, but it refused this probe` | MCP, but it rejected the request |
-
-## Install
-
-Python 3.9+, no third-party dependencies. Just drop `mcp-probe` in your PATH
-and, optionally, `_mcp-probe` in zsh's FPATH. E.g.:
-
-```
-INSTALL_PATH=~/.local/share/mcp-probe
-git clone https://github.com/jeremy-dolan/mcp-probe.git $INSTALL_PATH
-ln -s $INSTALL_PATH/mcp-probe ~/.local/bin/
-ln -s $INSTALL_PATH/completions/zsh/_mcp-probe ~/.zsh/completions/
 ```
