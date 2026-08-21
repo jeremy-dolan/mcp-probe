@@ -40,8 +40,8 @@ Exit status is 0 if the probe completes, 1 if it fails, 2 on a usage error.
 
 ## Install
 
-No third-party dependencies besides Python 3.9+. Drop `mcp-probe` in your PATH
-(and, optionally, `_mcp-probe` in zsh's FPATH). E.g.:
+The only requirement is vanilla Python 3.7+ (no third-party dependencies). Drop
+`mcp-probe` in your PATH (and, optionally, `_mcp-probe` in zsh's FPATH). E.g.:
 
 ```
 INSTALL_PATH=~/.local/share/mcp-probe
